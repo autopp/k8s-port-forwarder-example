@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
+	"os/signal"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -39,6 +41,8 @@ func NewCmd() *cobra.Command {
 			podName := args[0]
 			localPort := args[1]
 			remotePort := args[2]
+			cmdName := args[3]
+			cmdArgs := args[4:]
 
 			config, err := o.configFlags.ToRESTConfig()
 			if err != nil {
@@ -49,9 +53,6 @@ func NewCmd() *cobra.Command {
 				config.APIPath = "/api"
 			}
 			if config.NegotiatedSerializer == nil {
-				// This codec factory ensures the resources are not converted. Therefore, resources
-				// will not be round-tripped through internal versions. Defaulting does not happen
-				// on the client.
 				config.NegotiatedSerializer = scheme.Codecs.WithoutConversion()
 			}
 
@@ -95,16 +96,43 @@ func NewCmd() *cobra.Command {
 
 			dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, "POST", req.URL())
 			ports := []string{fmt.Sprintf("%s:%s", localPort, remotePort)}
-			stopChan := make(chan struct{}, 1)
-			readyChan := make(chan struct{})
+			stopCh := make(chan struct{}, 1)
+			readyCh := make(chan struct{})
 
-			fw, err := portforward.New(dialer, ports, stopChan, readyChan, os.Stdout, os.Stderr)
+			// stop by SIGINT
+			sigCh := make(chan os.Signal, 1)
+			signal.Notify(sigCh, os.Interrupt)
+			go func() {
+				<-sigCh
+				close(stopCh)
+			}()
+
+			fw, err := portforward.New(dialer, ports, stopCh, readyCh, os.Stdout, os.Stderr)
 
 			if err != nil {
 				return err
 			}
 
-			return fw.ForwardPorts()
+			go func() {
+				fw.ForwardPorts()
+			}()
+
+			// Run commands
+			c := exec.Command(cmdName, cmdArgs...)
+			c.Stdout = os.Stdout
+			c.Stderr = os.Stderr
+			c.Stdin = os.Stdin
+
+			<-readyCh
+			err = c.Start()
+			if err != nil {
+				return err
+			}
+
+			err = c.Wait()
+			close(stopCh)
+
+			return err
 		},
 	}
 
